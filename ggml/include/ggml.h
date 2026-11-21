@@ -2283,6 +2283,26 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Add a per-head logit bias that is gathered from a small table instead of being stored densely:
+    //   bias(k, t, h) = table[h, rows[k, t], t]   for k < rows->ne[0], else 0
+    // and softmax(scale*KQ + mask + bias) is computed. t counts the queries of all sequences (q->ne[1]*q->ne[3]).
+    // table: F32 [n_head, n_rows, n_queries] (contiguous), rows: I32 [<= n_kv, n_queries].
+    // The dense equivalent would need n_kv*n_queries*n_head values. Requires a mask, no kv_rows and q->ne[3] == 1.
+    GGML_API void ggml_flash_attn_ext_add_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * rows);
+
+    // Same, with the rows computed from positions instead of being stored for every (k, t):
+    //   d = q_pos[t] - kv_pos[k]
+    //   rows[k, t] = kv_pos[k] >= 0 && 0 <= d < n_rows - 1 ? d : n_rows - 1
+    // kv_pos: I32 [<= n_kv] (-1 for a cell without a position), q_pos: I32 [n_queries].
+    GGML_API void ggml_flash_attn_ext_add_rel_bias_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * kv_pos,
+            struct ggml_tensor * q_pos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

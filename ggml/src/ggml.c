@@ -5526,6 +5526,59 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_add_rel_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * rows) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] == NULL && a->src[7] == NULL);
+
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * mask = a->src[3];
+
+    GGML_ASSERT(mask != NULL && mask->ne[2] == 1);
+    GGML_ASSERT(a->src[5] == NULL); // not with kv_rows
+    GGML_ASSERT(q->ne[3] == 1);
+
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == 1);
+
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+    GGML_ASSERT(rows->ne[0] <= mask->ne[0] && rows->ne[1] == q->ne[1] && rows->ne[2] == 1 && rows->ne[3] == 1);
+
+    a->src[6] = table;
+    a->src[7] = rows;
+}
+
+void ggml_flash_attn_ext_add_rel_bias_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * kv_pos,
+        struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] == NULL && a->src[7] == NULL && a->src[8] == NULL);
+
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * mask = a->src[3];
+
+    GGML_ASSERT(mask != NULL && mask->ne[2] == 1);
+    GGML_ASSERT(a->src[5] == NULL); // not with kv_rows
+    GGML_ASSERT(q->ne[3] == 1);
+
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[1] >= 1 && table->ne[2] == q->ne[1] && table->ne[3] == 1);
+
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos) && ggml_is_vector(kv_pos));
+    GGML_ASSERT(kv_pos->ne[0] <= mask->ne[0]);
+
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && ggml_is_vector(q_pos));
+    GGML_ASSERT(q_pos->ne[0] == q->ne[1]);
+
+    a->src[6] = table;
+    a->src[7] = kv_pos;
+    a->src[8] = q_pos; // marks the position form of src[7]
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

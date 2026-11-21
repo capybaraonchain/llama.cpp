@@ -49,6 +49,7 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_FLASH_ATTN_REL_BIAS,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
@@ -807,6 +808,12 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // the same information as positions, for flash attention to compute the distance by itself (single stream):
+    // position of each cell (-1 if empty) and of each token
+    ggml_tensor * self_cell_pos     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_cell_pos_swa = nullptr; // I32 [n_kv_swa]
+    ggml_tensor * self_q_pos        = nullptr; // I32 [n_batch]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1336,7 +1343,10 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table = nullptr,  // [n_head_q, n_rows, n_tokens] bias table, see ggml_flash_attn_ext_add_rel_bias()
+            ggml_tensor * rel_rows  = nullptr,  // [n_kv, n_tokens] table row of each K/V cell, or with rel_q_pos: [n_kv] cell positions
+            ggml_tensor * rel_q_pos = nullptr) const; // [n_tokens] query positions, see ggml_flash_attn_ext_add_rel_bias_pos()
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1545,6 +1555,20 @@ struct llm_graph_context {
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
+    // same, with the bias given as a table that flash attention gathers by itself (cparams.fused_rel_bias):
+    // kq_b(k, t, h) = rel_table[h, rel_rows[k, t], t]
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * rel_table, // [n_head_q, n_rows, n_tokens]
+            ggml_tensor * rel_rows,  // [n_kv, n_tokens], or with rel_q_pos: [n_kv] cell positions
+            ggml_tensor * rel_q_pos, // [n_tokens] or nullptr
+            ggml_tensor * sinks,     // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 

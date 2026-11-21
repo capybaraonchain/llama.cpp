@@ -8870,6 +8870,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
 
+    // relative bias: bias(k, t, h) = table[h, rows[k, t], t], see ggml_flash_attn_ext_add_rel_bias()
+    const ggml_tensor * rel_table = dst->src[6];
+    // with src[8] the rows are computed from positions, see ggml_flash_attn_ext_add_rel_bias_pos()
+    const ggml_tensor * rel_rows  = dst->src[7];
+    const ggml_tensor * rel_q_pos = dst->src[8];
+    const int64_t       n_rel     = rel_rows ? rel_rows->ne[0] : 0;
+
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -8973,6 +8980,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        const float   * rel_tab = rel_table ? (const float   *) rel_table->data + (int64_t) iq1*rel_table->ne[0]*rel_table->ne[1] + iq2 : nullptr;
+        const int32_t * rel_idx = rel_rows  ? (const int32_t *) rel_rows->data  + (rel_q_pos ? 0 : (int64_t) iq1*n_rel) : nullptr;
+        const int32_t   rel_qp  = rel_q_pos ? ((const int32_t *) rel_q_pos->data)[iq1] : 0;
+        const int32_t   rel_ext = rel_table ? (int32_t) rel_table->ne[1] - 1 : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -9000,6 +9012,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             s += mv; // apply mask
+
+            if (rel_idx && ic < n_rel) {
+                int32_t row = rel_idx[ic];
+                if (rel_q_pos) {
+                    const int64_t d = (int64_t) rel_qp - row;
+                    row = row >= 0 && d >= 0 && d < rel_ext ? (int32_t) d : rel_ext;
+                }
+                s += rel_tab[(int64_t) row*rel_table->ne[0]]; // apply the relative bias
+            }
 
             const float Mold = M;
 
@@ -9553,7 +9574,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && dst->src[6] == nullptr && // the tiled path has no relative bias
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

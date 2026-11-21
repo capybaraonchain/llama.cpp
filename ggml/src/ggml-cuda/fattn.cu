@@ -7,6 +7,19 @@
 
 #if !defined(GGML_USE_MUSA)
 
+// scratch memory of the relative bias path, see ggml_cuda_flash_attn_ext_rel_bias()
+// GGML_CUDA_FATTN_REL_BIAS_SCRATCH_MIB overrides it
+#define GGML_CUDA_FATTN_REL_BIAS_SCRATCH (256ll*1024*1024)
+
+static int64_t ggml_cuda_fattn_rel_bias_scratch() {
+    static const int64_t res = [] {
+        const char * env = getenv("GGML_CUDA_FATTN_REL_BIAS_SCRATCH_MIB");
+        const int64_t mib = env ? atoll(env) : 0;
+        return mib > 0 ? mib*1024*1024 : GGML_CUDA_FATTN_REL_BIAS_SCRATCH;
+    }();
+    return res;
+}
+
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -589,6 +602,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * kv_rows = dst->src[5];
 
+    // a relative bias table is expanded to a mask per head, see ggml_cuda_flash_attn_ext_rel_bias()
+    const bool rel_bias      = dst->src[6] != nullptr;
+    const bool mask_per_head = mask && (mask->ne[2] != 1 || rel_bias);
+
+    if (rel_bias && (!mask || mask->ne[2] != 1 || kv_rows || Q->ne[3] != 1)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     // with kv_rows the kernel iterates over the mask columns
     const int64_t n_kv = kv_rows ? kv_rows->ne[0] : K->ne[1];
 
@@ -601,7 +622,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
     //     or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !mask_per_head && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -669,7 +690,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
+    if (mask_per_head) {
         // the kv_rows mask is compacted per sequence, it has no head dimension
         if (kv_rows) {
             return BEST_FATTN_KERNEL_NONE;
@@ -724,7 +745,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
-    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+    while (max_bias == 0.0f && !mask_per_head && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
         gqa_ratio_eff *= 2;
     }
 
@@ -812,14 +833,215 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    if (dst->src[6] != nullptr) {
+        // the query chunks of the relative bias path may run on any kernel, see ggml_cuda_flash_attn_ext_rel_bias()
+        need_f16_K = true;
+        need_f16_V = true;
+    }
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// The mask of a chunk of queries with the relative bias added, one mask per head:
+//   dst(k, j, h) = mask(k, t0 + j) + table[h, rows[k, t0 + j], t0 + j]
+// With q_pos the rows are computed from the positions rows[k] of the cells, see ggml_flash_attn_ext_add_rel_bias_pos().
+// grid: (k blocks, queries of the chunk, heads)
+static __global__ void flash_attn_rel_bias_mask(
+        const half * __restrict__ mask, const float * __restrict__ table, const int32_t * __restrict__ rows,
+        const int32_t * __restrict__ q_pos, half * __restrict__ dst,
+        const int n_kv, const int n_rel, const int n_head, const int n_rows, const int t0, const int64_t stride_mask) {
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n_kv) {
+        return;
+    }
+
+    const int     j = blockIdx.y;
+    const int     h = blockIdx.z;
+    const int64_t t = int64_t(t0) + j;
+
+    float m = __half2float(mask[t*stride_mask + k]);
+    if (k < n_rel) {
+        int row;
+        if (q_pos != nullptr) {
+            const int     p = rows[k];
+            const int64_t d = int64_t(q_pos[t]) - p;
+            row = p >= 0 && d >= 0 && d < n_rows - 1 ? int(d) : n_rows - 1;
+        } else {
+            row = rows[t*n_rel + k];
+        }
+        m += table[(t*n_rows + row)*n_head + h];
+    }
+
+    dst[(int64_t(h)*gridDim.y + j)*n_kv + k] = __float2half(m);
+}
+
+// K or V as F16, converted once for all query chunks; the same conversion as in launch_fattn()
+static void ggml_cuda_flash_attn_ext_rel_bias_f16(const ggml_tensor * T, half * T_f16, ggml_tensor & res, cudaStream_t stream) {
+    const size_t bs = ggml_blck_size(T->type);
+    const size_t ts = ggml_type_size(T->type);
+
+    res           = *T;
+    res.type      = GGML_TYPE_F16;
+    res.data      = T_f16;
+    res.view_src  = nullptr;
+    res.view_offs = 0;
+    res.nb[0]     = sizeof(half);
+
+    if (ggml_is_contiguously_allocated(T)) {
+        to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(T->type);
+        to_fp16(T->data, T_f16, ggml_nelements(T), stream);
+
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            res.nb[i] = T->nb[i]*bs*sizeof(half)/ts;
+        }
+    } else {
+        GGML_ASSERT(T->nb[0] == ts);
+        to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(T->type);
+        to_fp16(T->data, T_f16, T->ne[0], T->ne[1], T->ne[2], T->ne[3], T->nb[1]/ts, T->nb[2]/ts, T->nb[3]/ts, stream);
+
+        res.nb[1] = T->ne[0]*sizeof(half);
+        res.nb[2] = T->ne[1]*res.nb[1];
+        res.nb[3] = T->ne[2]*res.nb[2];
+    }
+}
+
+// Flash attention with a relative bias table (ggml_flash_attn_ext_add_rel_bias): the bias of all heads would be
+// n_kv x n_queries x n_head values, so it is built as an F16 mask per head for a bounded chunk of queries at a time,
+// and each chunk runs on the regular kernels. The scratch memory does not grow with the batch size.
+static void ggml_cuda_flash_attn_ext_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * table = dst->src[6];
+    const ggml_tensor * rows  = dst->src[7];
+    const ggml_tensor * q_pos = dst->src[8]; // set: rows holds the positions of the cells
+
+    GGML_ASSERT(mask && mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1);
+    GGML_ASSERT(q_pos == nullptr || q_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->src[5] == nullptr && Q->ne[3] == 1);
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_kv   = mask->ne[0];
+    const int64_t n_q    = Q->ne[1];
+    const int64_t n_head = Q->ne[2];
+
+    cudaStream_t stream = ctx.stream();
+
+    // queries per chunk: a power of two, within the scratch budget
+    const int64_t n_chunk_max = std::max<int64_t>(1, ggml_cuda_fattn_rel_bias_scratch() / (n_kv*n_head*sizeof(half)));
+    int64_t n_chunk = 1;
+    while (2*n_chunk <= n_chunk_max && n_chunk < n_q) {
+        n_chunk *= 2;
+    }
+    n_chunk = std::min(n_chunk, n_q);
+
+    ggml_cuda_pool_alloc<half> mask_chunk(ctx.pool(), n_kv*n_chunk*n_head + FATTN_KQ_STRIDE);
+
+    ggml_tensor Q_c    = *Q;
+    ggml_tensor mask_c = *mask;
+    ggml_tensor dst_c  = *dst;
+    ggml_tensor K_f16;
+    ggml_tensor V_f16;
+
+    mask_c.data      = mask_chunk.ptr;
+    mask_c.view_src  = nullptr;
+    mask_c.view_offs = 0;
+
+    dst_c.src[0] = &Q_c;
+    dst_c.src[3] = &mask_c;
+    dst_c.src[6] = nullptr;
+    dst_c.src[7] = nullptr;
+    dst_c.src[8] = nullptr;
+
+    auto set_chunk = [&](const int64_t t0, const int64_t n) {
+        Q_c.ne[1] = n;
+        Q_c.data  = (char *) Q->data + t0*Q->nb[1];
+
+        mask_c.ne[1] = n;
+        mask_c.ne[2] = n_head;
+        mask_c.nb[1] = n_kv*sizeof(half);
+        mask_c.nb[2] = n*mask_c.nb[1];
+        mask_c.nb[3] = n_head*mask_c.nb[2];
+
+        dst_c.ne[2] = n;
+        dst_c.nb[3] = n*dst_c.nb[2];
+        dst_c.data  = (char *) dst->data + t0*dst->nb[2];
+    };
+
+    // K and V are converted to F16 once, in the extra space after dst, unless the kernel of the chunks reads them as they are
+    {
+        set_chunk(0, n_chunk);
+
+        bool need_f16_K = false;
+        bool need_f16_V = false;
+
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &dst_c)) {
+            case BEST_FATTN_KERNEL_TILE:
+            case BEST_FATTN_KERNEL_MMA_F16:
+                need_f16_K = true;
+                need_f16_V = true;
+                break;
+            case BEST_FATTN_KERNEL_VEC: {
+                const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+                need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
+                need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
+            } break;
+            case BEST_FATTN_KERNEL_NONE:
+                GGML_ABORT("fatal error");
+        }
+
+        const bool conv_K = need_f16_K && K->type != GGML_TYPE_F16;
+        const bool conv_V = need_f16_V && V->type != GGML_TYPE_F16;
+
+        if (conv_K || conv_V) {
+            const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            GGML_ASSERT(!V_is_K_view);
+
+            // the layout that ggml_cuda_flash_attn_ext_get_alloc_size() reserved
+            const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+
+            if (conv_K) {
+                ggml_cuda_flash_attn_ext_rel_bias_f16(K, (half *) f16_extra.K, K_f16, stream);
+                dst_c.src[1] = &K_f16;
+            }
+            if (conv_V) {
+                ggml_cuda_flash_attn_ext_rel_bias_f16(V, (half *) f16_extra.V, V_f16, stream);
+                dst_c.src[2] = &V_f16;
+            }
+        }
+    }
+
+    const int64_t n_rel       = rows->ne[0];
+    const int64_t n_rows      = table->ne[1];
+    const int64_t stride_mask = mask->nb[1] / sizeof(half);
+
+    for (int64_t t0 = 0; t0 < n_q; t0 += n_chunk) {
+        const int64_t n = std::min(n_chunk, n_q - t0);
+        set_chunk(t0, n);
+
+        const dim3 block_dim(256, 1, 1);
+        const dim3 block_num((n_kv + block_dim.x - 1) / block_dim.x, n, n_head);
+        flash_attn_rel_bias_mask<<<block_num, block_dim, 0, stream>>>(
+            (const half *) mask->data, (const float *) table->data, (const int32_t *) rows->data,
+            q_pos ? (const int32_t *) q_pos->data : nullptr, mask_chunk.ptr,
+            n_kv, n_rel, n_head, n_rows, t0, stride_mask);
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_cuda_flash_attn_ext(ctx, &dst_c);
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (dst->src[6] != nullptr) {
+        ggml_cuda_flash_attn_ext_rel_bias(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

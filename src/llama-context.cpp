@@ -136,6 +136,12 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_flash_attn_rel_bias_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_REL_BIAS,
+    /*.name             =*/ "Flash Attention with a relative bias table",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -381,6 +387,12 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
         }
+    }
+
+    // resolved after flash attention, see resolve_fused_ops()
+    {
+        cparams.fused_rel_bias = false;
+        cparams.auto_frb       = getenv("LLAMA_REL_BIAS_DISABLE") == nullptr;
     }
 
     // initialized later
@@ -714,6 +726,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
+    }
+
+    // the fallback builds the dense n_kv x n_tokens x n_head bias
+    if (cparams.auto_frb) {
+        cparams.fused_rel_bias = cparams.flash_attn;
+        resolve(llm_fused_op_flash_attn_rel_bias_probe, cparams.fused_rel_bias);
+        cparams.auto_frb = false;
     }
 
     if (cparams.auto_fhc) {
