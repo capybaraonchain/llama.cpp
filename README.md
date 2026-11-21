@@ -1,6 +1,67 @@
 # llama.cpp
 
 > [!NOTE]
+> **This branch (`inkling2-12gb`): Inkling 2 Mini at 128k context on a 12 GB NVIDIA card.**
+> It is [realugbun's `inkling2-speed`](https://github.com/realugbun/llama.cpp/tree/inkling2-speed) (fused CUDA kernels for
+> Inkling 2, described further down, all credit to them) merged with upstream master `19bc41d`, plus two commits for the
+> case where the model does not fit in VRAM and the MoE expert weights of some layers stay in RAM:
+>
+> 1. **Relative-position bias inside flash attention.** Inkling 2 adds a bias to every attention score, taken from a small
+>    per-head table by the distance between query and key. Upstream builds that bias as a dense `n_kv x n_tokens x n_head`
+>    tensor per layer, which at 128k forces tiny batches. Here `FLASH_ATTN_EXT` gets the table plus the position of each
+>    KV cell and each query, and the kernel computes the distance itself (CUDA and CPU). No tensor grows with
+>    context x batch any more.
+> 2. **Per-split copies of host weights** (`GGML_SCHED_WEIGHT_COPY_PER_SPLIT=1`). When expert weights that live in RAM are
+>    uploaded to the GPU for prompt processing, the scheduler kept the copies of the looped layers (6-17, run three times
+>    per token) allocated for the whole graph, which did not fit and, at `19bc41d`, gave NaN output for this model. With
+>    the variable set, each split gets its own copy and the memory is reused.
+>
+> Measured on an RTX 4070 Super (12 GB) with an i5-14400F, Inkling 2 Mini Q4_K, 128k context, q8_0 KV cache, tokens/s:
+>
+> | build | prompt processing | generation |
+> |---|---:|---:|
+> | upstream `19bc41d` | about 100 | 27.5 |
+> | realugbun `inkling2-speed` | about 100 | 33.0 |
+> | this branch | about 1,000 | about 33 |
+>
+> A 32k-token prompt went from 382 s to 50 s; a 120k-token prompt reads in 205 s. At 64k context (more experts fit on the
+> GPU): 1,160 prompt, 39.7 generation. Generation is limited by how many expert weights fit in VRAM (about 587 MiB per
+> layer at Q4_K, about 2 ms per token for each looped layer left on the CPU).
+>
+> The settings behind the 128k row (9 of the 12 looped layers keep their experts on the GPU, the rest stay in RAM):
+>
+> ```bash
+> GGML_SCHED_WEIGHT_COPY_PER_SPLIT=1 GGML_CUDA_FATTN_REL_BIAS_SCRATCH_MIB=128 llama-server -m Inkling-2-Mini-Q4_K.gguf --jinja -fa on \
+>   -c 131072 -ngl 99 -fit off -lm none -ub 1024 -b 2048 -ctk q8_0 -ctv q8_0 -t 6 -kvu \
+>   -ot 'blk\.([0-5]|1[5-9]|2[0-3])\.ffn_.*_exps\.weight=CPU'
+> ```
+>
+> - `-ot ...=CPU` picks the layers whose experts stay in RAM. Keep the looped layers (6-17) on the GPU first: they run
+>   three times per token. Widen or narrow the `1[5-9]` range for your VRAM.
+> - `-lm none` reads the RAM weights into pinned memory, so their per-batch upload is faster (prompt processing +25%).
+> - `-kvu` (one shared KV stream) is required for the fused bias path, also with several slots (`-np 2 -kvu` works).
+> - `GGML_CUDA_FATTN_REL_BIAS_SCRATCH_MIB` (default 256) sizes the kernel's scratch buffer; 128 frees 128 MiB for about
+>   5% slower processing of very long prompts.
+> - `LLAMA_REL_BIAS_ROWS=1` uses a row-index tensor instead of positions and `LLAMA_REL_BIAS_DISABLE=1` the dense bias,
+>   for comparison.
+>
+> Other things measured on this card, to save you the time: more than 6 threads (the P-cores) does not help; putting
+> only half of a layer's experts on the GPU is slower; with the image encoder (mmproj) on the GPU and two slots the same
+> setup gives about 900 / 31.8 tokens/s, and 19.9 + 17.7 with both slots generating; speculative decoding with the
+> DSpark drafter (upstream PR #32218) is slower here (30.6 without, 28.4 with drafts of 1 token, 25.4 with drafts of 3):
+> the drafter takes about 1 GB of VRAM and verifying drafted tokens costs almost as much as generating them while
+> experts run on the CPU.
+>
+> Checks: `llama-perplexity --kl-divergence` against the dense-bias path shows differences at the level of two runs of
+> the same path (largest about 0.00006). There are no new `test-backend-ops` cases for the two new
+> `ggml_flash_attn_ext_add_rel_bias*` forms, and everything was measured on one machine only.
+>
+> Disclosure: the two commits and this note were written by an AI assistant (Claude) working with the owner of this fork,
+> who ran and measured them on the hardware above. That is why this is a fork branch and not an upstream pull request:
+> upstream asks for human-written descriptions and a full human review. Anyone who wants to take the idea upstream is
+> welcome to; upstream PR #32740 works on the same bias problem in a different way.
+
+> [!NOTE]
 > **This fork: faster Inkling 2 on CUDA.** Branch `inkling2-speed` is upstream master plus four commits that make
 > Inkling 2 Mini run faster on NVIDIA GPUs: the depth states are normalized once per block, and the model's small glue
 > op chains run as fused CUDA kernels (`ggml/src/ggml-cuda/inkling2.cu`). Build it the usual way (`-DGGML_CUDA=ON`);
